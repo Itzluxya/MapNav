@@ -2,15 +2,16 @@
 """Build a dense, real-road-following Delhi NCR graph for Map Navigator.
 
 Fetches real driving geometries between 48 Delhi NCR landmarks/intersections
-across ~90 major road corridors using OSRM, downsamples intermediate road
-geometry nodes to ~100-140m spacing, and writes backend/data/delhi_demo_graph.csv.
+across ~105 road corridors using OSRM, cleans divided-carriageway U-turn loops,
+uses high-resolution sampling (~150m) on primary arterial corridors (speed >= 40 kph)
+and coarse sampling (~750m) on secondary collector corridors (speed <= 35 kph),
+and writes backend/data/delhi_demo_graph.csv.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,6 +32,24 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2.0 * EARTH_RADIUS_M * math.asin(math.sqrt(min(1.0, max(0.0, a))))
 
 
+def poly_length_m(pts: list[tuple[float, float]]) -> float:
+    return sum(haversine_m(a[0], a[1], b[0], b[1]) for a, b in zip(pts, pts[1:]))
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    dlon = math.radians(lon2 - lon1)
+    lat1_r = math.radians(lat1)
+    lat2_r = math.radians(lat2)
+    y = math.sin(dlon) * math.cos(lat2_r)
+    x = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def angle_diff_deg(b1: float, b2: float) -> float:
+    diff = abs(b1 - b2) % 360.0
+    return 360.0 - diff if diff > 180.0 else diff
+
+
 # 48 Named Landmarks & Critical Intersections (0..47)
 LANDMARKS: list[tuple[int, float, float, str]] = [
     (0, 28.612900, 77.229500, "India Gate"),
@@ -44,8 +63,8 @@ LANDMARKS: list[tuple[int, float, float, str]] = [
     (8, 28.655200, 77.170200, "Patel Nagar"),
     (9, 28.567700, 77.243200, "Lajpat Nagar"),
     (10, 28.549500, 77.251300, "Nehru Place"),
-    (11, 28.555300, 77.242900, "Greater Kailash"),
-    (12, 28.549400, 77.200100, "Hauz Khas"),
+    (11, 28.545000, 77.241500, "Greater Kailash"),
+    (12, 28.544200, 77.206000, "Hauz Khas"),
     (13, 28.524500, 77.206600, "Saket"),
     (14, 28.567200, 77.210000, "AIIMS"),
     (15, 28.569400, 77.193000, "Safdarjung"),
@@ -83,147 +102,152 @@ LANDMARKS: list[tuple[int, float, float, str]] = [
     (47, 28.673000, 77.289000, "Shahdara"),
 ]
 
-# ~90 Realistic Delhi NCR Road Corridors: (u, v, road_name, speed_kph, direction)
-CORRIDORS: list[tuple[int, int, str, int, str]] = [
+# Corridor definition: (u, v, road_name, speed_kph, direction, optional_via_waypoints)
+CorridorSpec = tuple[int, int, str, int, str, list[tuple[float, float]]]
+
+CORRIDORS: list[CorridorSpec] = [
+    # --- Primary Arterial Corridors (speed >= 40 kph, finely sampled ~150m) ---
     # Central & Lutyens Delhi
-    (0, 1, "Janpath", 40, "B"),
-    (0, 2, "Kasturba Gandhi Marg", 40, "B"),
-    (1, 2, "Barakhamba Road", 35, "B"),
-    (1, 37, "Deen Dayal Upadhyaya Marg", 40, "B"),
-    (37, 24, "Bahadur Shah Zafar Marg", 35, "B"),
-    (2, 3, "Chelmsford Road", 30, "B"),
-    (2, 24, "Jawaharlal Nehru Marg", 35, "B"),
-    (0, 14, "Sri Aurobindo Marg", 45, "B"),
-    (0, 25, "Lodhi Road", 45, "B"),
-    (0, 39, "Subramania Bharti Marg", 45, "B"),
-    (0, 41, "Sardar Patel Marg", 50, "B"),
-    (2, 41, "Mother Teresa Crescent", 45, "B"),
+    (0, 1, "Janpath", 45, "B", []),
+    (0, 2, "Kasturba Gandhi Marg", 45, "B", []),
+    (1, 2, "Barakhamba Road", 42, "B", []),
+    (1, 37, "Deen Dayal Upadhyaya Marg", 42, "B", []),
+    (37, 24, "Bahadur Shah Zafar Marg", 42, "B", []),
+    (2, 3, "Chelmsford Road", 40, "B", []),
+    (2, 24, "Jawaharlal Nehru Marg", 40, "B", []),
+    (0, 14, "Sri Aurobindo Marg", 48, "B", [(28.5890, 77.2125)]),
+    (0, 25, "Lodhi Road", 45, "B", []),
+    (0, 39, "Subramania Bharti Marg", 45, "B", []),
+    (0, 41, "Sardar Patel Marg", 50, "B", [(28.6015, 77.1865)]),
+    (2, 41, "Mother Teresa Crescent", 48, "B", [(28.6105, 77.1910)]),
 
     # North & Central-West (Civil Lines / Kashmere Gate / Tis Hazari / Karol Bagh / Rajendra Place)
-    (4, 5, "Lala Hardev Sahai Marg", 40, "B"),
-    (5, 28, "Rajpur Road", 35, "B"),
-    (4, 28, "Boulevard Road", 40, "B"),
-    (28, 29, "Rani Jhansi Road", 40, "B"),
-    (29, 6, "Rani Jhansi Road", 35, "B"),
-    (29, 31, "Faiz Road", 35, "B"),
-    (29, 30, "Desh Bandhu Gupta Road", 35, "B"),
-    (3, 30, "Desh Bandhu Gupta Road", 30, "B"),
-    (30, 31, "Desh Bandhu Gupta Road", 35, "B"),
-    (31, 6, "Desh Bandhu Gupta Road", 35, "B"),
-    (2, 30, "Panchkuian Road", 35, "B"),
-    (2, 31, "Panchkuian Road", 40, "B"),
-    (31, 7, "Pusa Road", 40, "B"),
-    (6, 7, "Pusa Road", 35, "B"),
-    (7, 8, "Patel Road", 40, "B"),
-    (7, 32, "Pusa Road", 40, "B"),
-    (8, 32, "Loha Mandi Road", 35, "B"),
-    (6, 8, "Satguru Ram Singh Marg", 35, "B"),
+    (4, 5, "Lala Hardev Sahai Marg", 42, "B", []),
+    (5, 28, "Rajpur Road", 42, "B", []),
+    (4, 28, "Boulevard Road", 42, "B", []),
+    (28, 29, "Rani Jhansi Road", 45, "B", []),
+    (29, 6, "Rani Jhansi Road", 42, "B", []),
+    (29, 31, "Faiz Road", 42, "B", []),
+    (29, 30, "Desh Bandhu Gupta Road", 40, "B", []),
+    (3, 30, "Desh Bandhu Gupta Road", 40, "B", []),
+    (30, 31, "Desh Bandhu Gupta Road", 40, "B", []),
+    (31, 6, "Desh Bandhu Gupta Road", 40, "B", []),
+    (2, 30, "Panchkuian Road", 40, "B", []),
+    (2, 31, "Panchkuian Road", 42, "B", []),
+    (31, 7, "Pusa Road", 45, "B", []),
+    (6, 7, "Pusa Road", 42, "B", []),
+    (7, 8, "Patel Road", 45, "B", []),
+    (7, 32, "Pusa Road", 42, "B", []),
+    (8, 32, "Loha Mandi Road", 40, "B", []),
+    (6, 8, "Satguru Ram Singh Marg", 40, "B", []),
 
     # Old Delhi & North Ring
-    (24, 23, "Netaji Subhash Marg", 30, "B"),
-    (24, 38, "Netaji Subhash Marg", 35, "B"),
-    (23, 38, "Chandni Chowk", 25, "B"),
-    (38, 4, "Lothian Road", 35, "B"),
-    (23, 4, "SP Mukherjee Marg", 30, "B"),
-    (3, 24, "Asaf Ali Road", 30, "B"),
-    (3, 23, "Shradhanand Marg", 25, "B"),
-    (28, 23, "SP Mukherjee Marg", 30, "B"),
-    (5, 36, "Mall Road", 40, "B"),
-    (28, 36, "Roshanara Road", 35, "B"),
+    (24, 23, "Netaji Subhash Marg", 40, "B", []),
+    (24, 38, "Netaji Subhash Marg", 42, "B", []),
+    (23, 38, "Chandni Chowk", 30, "B", []),
+    (38, 4, "Lothian Road", 42, "B", []),
+    (23, 4, "SP Mukherjee Marg", 40, "B", []),
+    (3, 24, "Asaf Ali Road", 35, "B", []),
+    (3, 23, "Shradhanand Marg", 30, "B", []),
+    (28, 23, "SP Mukherjee Marg", 40, "B", []),
+    (5, 36, "Mall Road", 45, "B", []),
+    (28, 36, "Roshanara Road", 40, "B", []),
 
     # North-West (DU / NSP / Punjabi Bagh / Rohini / Patel Nagar)
-    (36, 34, "Inner Ring Road", 50, "B"),
-    (34, 35, "Outer Ring Road", 50, "B"),
-    (34, 33, "Mahatma Gandhi Marg", 50, "B"),
-    (33, 35, "Rohtak Road", 45, "B"),
-    (8, 33, "Rohtak Road", 40, "B"),
-    (29, 34, "Kalidas Marg", 40, "B"),
-    (32, 33, "Mahatma Gandhi Marg", 45, "B"),
-    (32, 41, "Upper Ridge Road", 45, "B"),
-    (7, 41, "Vandemataram Marg", 45, "B"),
+    (36, 34, "Inner Ring Road", 50, "B", []),
+    (34, 35, "Outer Ring Road", 50, "B", []),
+    (34, 33, "Mahatma Gandhi Marg", 50, "B", []),
+    (33, 35, "Rohtak Road", 45, "B", []),
+    (8, 33, "Rohtak Road", 45, "B", []),
+    (29, 34, "Kalidas Marg", 42, "B", []),
+    (32, 33, "Mahatma Gandhi Marg", 45, "B", []),
+    (32, 41, "Upper Ridge Road", 48, "B", []),
+    (7, 41, "Vandemataram Marg", 48, "B", []),
 
     # South-West & Airport / Gurugram / Dwarka
-    (41, 42, "Mahatma Gandhi Marg", 50, "B"),
-    (42, 15, "Ring Road", 45, "B"),
-    (15, 14, "Mahatma Gandhi Marg", 45, "B"),
-    (41, 44, "NH 48", 60, "B"),
-    (44, 18, "IGI Airport Approach Road", 50, "B"),
-    (44, 27, "Abdul Gaffar Khan Marg", 45, "B"),
-    (44, 16, "NH 48", 65, "B"),
-    (16, 17, "NH 48", 65, "B"),
-    (18, 19, "Dwarka Sector Road", 50, "B"),
-    (41, 19, "Station Road", 45, "B"),
-    (33, 19, "Najafgarh Road", 45, "B"),
-    (19, 17, "Dwarka Expressway", 65, "B"),
+    (41, 42, "Mahatma Gandhi Marg", 50, "B", []),
+    (42, 15, "Ring Road", 48, "B", []),
+    (15, 14, "Mahatma Gandhi Marg", 48, "B", []),
+    (41, 44, "NH 48", 60, "B", []),
+    (44, 18, "IGI Airport Approach Road", 55, "B", []),
+    (44, 27, "Abdul Gaffar Khan Marg", 48, "B", []),
+    (44, 16, "NH 48", 65, "B", []),
+    (16, 17, "NH 48", 65, "B", []),
+    (18, 19, "Dwarka Sector Road", 50, "B", []),
+    (41, 19, "Station Road", 45, "B", []),
+    (33, 19, "Najafgarh Road", 45, "B", []),
+    (19, 17, "Dwarka Expressway", 65, "B", []),
 
     # South Delhi (AIIMS / Hauz Khas / IIT / Saket / Vasant Kunj / GK / Nehru Place)
-    (15, 12, "Africa Avenue", 40, "B"),
-    (15, 43, "Africa Avenue", 40, "B"),
-    (14, 12, "Sri Aurobindo Marg", 40, "B"),
-    (12, 43, "Outer Ring Road", 45, "B"),
-    (43, 27, "Nelson Mandela Marg", 45, "B"),
-    (43, 13, "Press Enclave Marg", 40, "B"),
-    (12, 13, "Sri Aurobindo Marg", 40, "B"),
-    (13, 27, "Mehrauli Badarpur Road", 40, "B"),
-    (14, 9, "Mahatma Gandhi Marg", 45, "B"),
-    (12, 11, "Outer Ring Road", 45, "B"),
-    (9, 11, "Lala Lajpat Rai Marg", 35, "B"),
-    (11, 10, "Outer Ring Road", 40, "B"),
-    (9, 10, "Lala Lajpat Rai Marg", 40, "B"),
-    (10, 13, "Outer Ring Road", 40, "B"),
-    (10, 45, "Ma Anandmayee Marg", 40, "B"),
+    # Direct Outer Ring Road between Hauz Khas (12) and Greater Kailash (11)
+    (12, 11, "Outer Ring Road", 50, "B", []),
+    (15, 12, "Africa Avenue", 42, "B", []),
+    (15, 43, "Africa Avenue", 42, "B", []),
+    (14, 12, "Sri Aurobindo Marg", 45, "B", []),
+    (12, 43, "Outer Ring Road", 48, "B", []),
+    (43, 27, "Nelson Mandela Marg", 48, "B", []),
+    (43, 13, "Press Enclave Marg", 42, "B", []),
+    (12, 13, "Sri Aurobindo Marg", 45, "B", []),
+    (13, 27, "Mehrauli Badarpur Road", 45, "B", []),
+    (14, 9, "Mahatma Gandhi Marg", 48, "B", []),
+    (9, 11, "Lala Lajpat Rai Marg", 42, "B", []),
+    (11, 10, "Outer Ring Road", 48, "B", []),
+    (9, 10, "Lala Lajpat Rai Marg", 45, "B", []),
+    (10, 13, "Outer Ring Road", 45, "B", [(28.5315, 77.2290)]),
+    (10, 45, "Ma Anandmayee Marg", 42, "B", []),
 
     # South-East & Ring Road (Jangpura / Nizamuddin / Sarai Kale Khan / Ashram / Okhla)
-    (25, 39, "Lala Lajpat Rai Marg", 40, "B"),
-    (39, 40, "Mahatma Gandhi Marg", 50, "B"),
-    (25, 9, "Lala Lajpat Rai Marg", 40, "B"),
-    (25, 26, "Mathura Road", 40, "B"),
-    (40, 26, "Mahatma Gandhi Marg", 50, "B"),
-    (9, 26, "Mahatma Gandhi Marg", 45, "B"),
-    (26, 45, "Mathura Road", 45, "B"),
-    (37, 39, "Mathura Road", 45, "B"),
-    (37, 40, "Mahatma Gandhi Marg", 55, "B"),
+    (25, 39, "Lala Lajpat Rai Marg", 45, "B", []),
+    (39, 40, "Mahatma Gandhi Marg", 50, "B", []),
+    (25, 9, "Lala Lajpat Rai Marg", 45, "B", []),
+    (25, 26, "Mathura Road", 45, "B", []),
+    (40, 26, "Mahatma Gandhi Marg", 50, "B", []),
+    (9, 26, "Mahatma Gandhi Marg", 45, "B", []),
+    (26, 45, "Mathura Road", 45, "B", []),
+    (37, 39, "Mathura Road", 48, "B", []),
+    (37, 40, "Mahatma Gandhi Marg", 55, "B", []),
 
     # Trans-Yamuna / East Delhi / Noida
-    (37, 46, "Vikas Marg", 45, "B"),
-    (46, 21, "NH 9", 50, "B"),
-    (21, 40, "Delhi Meerut Expressway", 60, "B"),
-    (21, 22, "Noida Link Road", 50, "B"),
-    (40, 22, "Noida Link Road", 50, "B"),
-    (26, 20, "DND Flyway", 60, "B"),
-    (22, 20, "Noida Link Road", 55, "B"),
-    (45, 20, "Kalindi Kunj Road", 45, "B"),
-    (4, 47, "Grand Trunk Road", 45, "B"),
-    (46, 47, "Swami Dayanand Marg", 40, "B"),
+    (37, 46, "Vikas Marg", 48, "B", []),
+    (46, 21, "NH 9", 50, "B", []),
+    (21, 40, "Delhi Meerut Expressway", 60, "B", []),
+    (21, 22, "Noida Link Road", 50, "B", []),
+    (40, 22, "Noida Link Road", 50, "B", []),
+    (26, 20, "DND Flyway", 60, "B", []),
+    (22, 20, "Noida Link Road", 55, "B", []),
+    (45, 20, "Kalindi Kunj Road", 45, "B", []),
+    (4, 47, "Grand Trunk Road", 45, "B", []),
+    (46, 47, "Swami Dayanand Marg", 42, "B", []),
+
+    # --- Secondary / Collector Corridors (speed <= 30 kph, coarsely sampled ~750m) ---
+    # These represent lower-speed interior colony/collector routes with fewer graph hops
+    # but longer physical distance and slower travel speed than primary arterials.
+    (12, 11, "Siri Fort - Panchsheel Collector Road", 25, "B", [(28.5545, 77.2185), (28.5555, 77.2335)]),
+    (12, 9, "August Kranti Collector Marg", 26, "B", [(28.5565, 77.2195), (28.5635, 77.2320)]),
+    (14, 11, "Andrews Ganj Collector Road", 26, "B", [(28.5610, 77.2285)]),
+    (13, 11, "Sheikh Sarai Collector Road", 26, "B", [(28.5320, 77.2250)]),
+    (3, 25, "Paharganj - Sujan Singh Collector Road", 25, "B", [(28.6220, 77.2060), (28.5980, 77.2180)]),
+    (5, 6, "Malka Ganj - Anand Parbat Collector Road", 25, "B", [(28.6720, 77.1980), (28.6615, 77.1820)]),
+    (6, 41, "Naraina - Ridge Collector Road", 26, "B", [(28.6280, 77.1520)]),
+    (2, 15, "Chanakyapuri Collector Road", 26, "B", [(28.6020, 77.1880)]),
+    (37, 9, "Sundar Nagar Collector Road", 26, "B", [(28.6050, 77.2520)]),
+    (41, 27, "Vasant Vihar Collector Road", 26, "B", [(28.5580, 77.1520)]),
+    (36, 8, "Shakti Nagar - Inderlok Collector Road", 25, "B", [(28.6780, 77.1720)]),
 ]
 
 
-def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    dlon = math.radians(lon2 - lon1)
-    lat1_r = math.radians(lat1)
-    lat2_r = math.radians(lat2)
-    y = math.sin(dlon) * math.cos(lat2_r)
-    x = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
-    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-
-
-def angle_diff_deg(b1: float, b2: float) -> float:
-    diff = abs(b1 - b2) % 360.0
-    return 360.0 - diff if diff > 180.0 else diff
-
-
-def trim_uturn_hooks(
+def clean_osrm_polyline(
     coords: list[tuple[float, float]],
     u_lat: float,
     u_lon: float,
     v_lat: float,
     v_lon: float,
 ) -> list[tuple[float, float]]:
-    """Remove OSRM divided-carriageway U-turn loops near start/end landmarks."""
+    """Trim endpoint divided-carriageway U-turn hooks and splice out mid-route self-loops."""
     if len(coords) <= 2:
-        return coords
+        return [(u_lat, u_lon), (v_lat, v_lon)]
     direct = haversine_m(u_lat, u_lon, v_lat, v_lon)
-    hook_radius = min(300.0, direct * 0.26)
+    hook_radius = min(400.0, direct * 0.30)
     start_idx = 0
     for i in range(len(coords) - 1):
         if haversine_m(u_lat, u_lon, coords[i][0], coords[i][1]) <= hook_radius:
@@ -232,7 +256,23 @@ def trim_uturn_hooks(
     for i in range(len(coords) - 1, start_idx, -1):
         if haversine_m(v_lat, v_lon, coords[i][0], coords[i][1]) <= hook_radius:
             end_idx = i
-    return [(u_lat, u_lon)] + coords[start_idx + 1 : end_idx] + [(v_lat, v_lon)]
+    pts = [(u_lat, u_lon)] + coords[start_idx + 1 : end_idx] + [(v_lat, v_lon)]
+
+    cleaned: list[tuple[float, float]] = []
+    i = 0
+    n = len(pts)
+    while i < n:
+        cleaned.append(pts[i])
+        best_j = i + 1
+        for j in range(n - 1, i + 2, -1):
+            chord = haversine_m(pts[i][0], pts[i][1], pts[j][0], pts[j][1])
+            if chord <= 95.0:
+                arc = poly_length_m(pts[i : j + 1])
+                if arc > chord * 2.2 and arc > 140.0:
+                    best_j = j
+                    break
+        i = best_j
+    return cleaned
 
 
 def downsample_coords(
@@ -241,15 +281,24 @@ def downsample_coords(
     start_lon: float,
     end_lat: float,
     end_lon: float,
-    min_step_m: float = 380.0,
-    turn_step_m: float = 115.0,
-    turn_angle_deg: float = 24.0,
+    speed_kph: int,
 ) -> list[tuple[float, float]]:
-    """Snap endpoints to exact landmark coordinates, trim median U-turn hooks,
-    and downsample intermediate points while preserving curves and turns."""
-    coords = trim_uturn_hooks(coords, start_lat, start_lon, end_lat, end_lon)
+    """Downsample corridor coordinates based on road class:
+    - Primary arterials (speed >= 40 kph): fine ~155m spacing (80m on curves) for smooth geometry
+    - Secondary collectors (speed <= 35 kph): coarse ~850m spacing (550m on curves) for fewer hops
+    """
+    coords = clean_osrm_polyline(coords, start_lat, start_lon, end_lat, end_lon)
     if len(coords) <= 2:
         return [(start_lat, start_lon), (end_lat, end_lon)]
+
+    if speed_kph >= 40:
+        min_step_m = 155.0
+        turn_step_m = 75.0
+        turn_angle_deg = 18.0
+    else:
+        min_step_m = 950.0
+        turn_step_m = 650.0
+        turn_angle_deg = 50.0
 
     kept: list[tuple[float, float]] = [(start_lat, start_lon)]
     last_lat, last_lon = start_lat, start_lon
@@ -275,21 +324,33 @@ def downsample_coords(
             last_lat, last_lon = lat, lon
 
     kept.append((end_lat, end_lon))
+
+    # For primary arterials, subdivide any long straight span (> 170m) so geometry nodes
+    # are evenly distributed along flyovers and expressways.
+    if speed_kph >= 40:
+        densified: list[tuple[float, float]] = [kept[0]]
+        for (lat1, lon1), (lat2, lon2) in zip(kept, kept[1:]):
+            seg_d = haversine_m(lat1, lon1, lat2, lon2)
+            if seg_d > 170.0:
+                sub_steps = int(math.ceil(seg_d / 140.0))
+                for s in range(1, sub_steps):
+                    frac = s / sub_steps
+                    densified.append((lat1 + (lat2 - lat1) * frac, lon1 + (lon2 - lon1) * frac))
+            densified.append((lat2, lon2))
+        return densified
+
     return kept
 
 
 def fetch_osrm_corridor(
     corridor_idx: int,
-    u_lat: float,
-    u_lon: float,
-    v_lat: float,
-    v_lon: float,
+    waypoints: list[tuple[float, float]],
 ) -> tuple[int, list[tuple[float, float]], bool]:
-    """Fetch full driving polyline from OSRM with retries."""
+    """Fetch full driving polyline from OSRM across waypoints with retries."""
+    coord_str = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in waypoints)
     url = (
         f"https://router.project-osrm.org/route/v1/driving/"
-        f"{u_lon:.6f},{u_lat:.6f};{v_lon:.6f},{v_lat:.6f}"
-        f"?overview=full&geometries=geojson"
+        f"{coord_str}?overview=full&geometries=geojson"
     )
     for attempt in range(4):
         try:
@@ -307,16 +368,18 @@ def fetch_osrm_corridor(
         except Exception:
             time.sleep(0.35 * (attempt + 1))
 
-    # Fallback: interpolate intermediate points if OSRM was unreachable
-    dist = haversine_m(u_lat, u_lon, v_lat, v_lon)
-    steps = max(2, int(dist // 140.0))
-    fallback = [
-        (
-            u_lat + (v_lat - u_lat) * (i / steps),
-            u_lon + (v_lon - u_lon) * (i / steps),
-        )
-        for i in range(steps + 1)
-    ]
+    # Fallback: interpolate between waypoints
+    fallback: list[tuple[float, float]] = [waypoints[0]]
+    for (lat1, lon1), (lat2, lon2) in zip(waypoints, waypoints[1:]):
+        dist = haversine_m(lat1, lon1, lat2, lon2)
+        steps = max(2, int(dist // 160.0))
+        for i in range(1, steps + 1):
+            fallback.append(
+                (
+                    lat1 + (lat2 - lat1) * (i / steps),
+                    lon1 + (lon2 - lon1) * (i / steps),
+                )
+            )
     return corridor_idx, fallback, False
 
 
@@ -331,10 +394,11 @@ def main() -> int:
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures = []
-        for idx, (u, v, road_name, speed, direction) in enumerate(CORRIDORS):
+        for idx, (u, v, road_name, speed, direction, via) in enumerate(CORRIDORS):
             u_lat, u_lon, _ = landmark_by_id[u]
             v_lat, v_lon, _ = landmark_by_id[v]
-            futures.append(pool.submit(fetch_osrm_corridor, idx, u_lat, u_lon, v_lat, v_lon))
+            waypoints = [(u_lat, u_lon)] + list(via) + [(v_lat, v_lon)]
+            futures.append(pool.submit(fetch_osrm_corridor, idx, waypoints))
 
         for fut in as_completed(futures):
             idx, coords, ok = fut.result()
@@ -348,11 +412,11 @@ def main() -> int:
     edges: list[tuple[int, int, str, int, str]] = []
     next_node_id = len(LANDMARKS)
 
-    for idx, (u, v, road_name, speed, direction) in enumerate(CORRIDORS):
+    for idx, (u, v, road_name, speed, direction, _via) in enumerate(CORRIDORS):
         u_lat, u_lon, _ = landmark_by_id[u]
         v_lat, v_lon, _ = landmark_by_id[v]
         raw_coords = corridor_geometries[idx]
-        sampled = downsample_coords(raw_coords, u_lat, u_lon, v_lat, v_lon)
+        sampled = downsample_coords(raw_coords, u_lat, u_lon, v_lat, v_lon, speed)
 
         chain_ids = [u]
         for lat, lon in sampled[1:-1]:

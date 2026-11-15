@@ -7,8 +7,25 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const kMaxSupportedSpeedMps = 110.0 / 3.6;
+const kHeuristicFastestSpeedMps = 45.0 / 3.6;
 const kMaximumSnapDistanceMeters = 3000.0;
+const kMetersPerDegreeLat = 111132.0;
+const kMetersPerDegreeLng = 111320.0 * Math.cos((28.6139 * Math.PI) / 180.0);
+
+const ALGORITHM_NAMES = {
+  astar: 'A*',
+  dijkstra: 'Dijkstra',
+  bfs: 'BFS',
+  dfs: 'DFS',
+};
+
+function parseAlgorithm(raw) {
+  const val = (raw || '').toLowerCase();
+  if (val === 'dijkstra') return 'dijkstra';
+  if (val === 'bfs') return 'bfs';
+  if (val === 'dfs') return 'dfs';
+  return 'astar';
+}
 
 function haversineMeters(first, second) {
   const earthRadiusMeters = 6371000.0;
@@ -47,7 +64,6 @@ function angleDifferenceDegrees(previousBearing, nextBearing) {
 function turnDescription(previousBearing, nextBearing) {
   const difference = angleDifferenceDegrees(previousBearing, nextBearing);
   if (Math.abs(difference) < 28.0) return "Continue";
-  if (Math.abs(difference) > 145.0) return "Make a U-turn";
   return difference > 0 ? "Turn right" : "Turn left";
 }
 
@@ -57,6 +73,8 @@ class RoadGraph {
     this.adjacency = [];
     this.edgeCount = 0;
     this.kdTree = null;
+    this.xMeters = new Float64Array(0);
+    this.yMeters = new Float64Array(0);
   }
 
   loadCsv(filePath) {
@@ -79,12 +97,14 @@ class RoadGraph {
         if (id !== this.nodes.length) {
           throw new Error(`Node identifiers must be sequential: expected ${this.nodes.length}, got ${id}`);
         }
+        const latitude = parseFloat(fields[2]);
+        const longitude = parseFloat(fields[3]);
         const isLandmark = !fields[4].startsWith('OSM node ');
         this.nodes.push({
           id,
           point: {
-            latitude: parseFloat(fields[2]),
-            longitude: parseFloat(fields[3]),
+            latitude,
+            longitude,
           },
           name: fields[4],
           isLandmark,
@@ -121,6 +141,13 @@ class RoadGraph {
           addDirectedEdge(to, from);
         }
       }
+    }
+
+    this.xMeters = new Float64Array(this.nodes.length);
+    this.yMeters = new Float64Array(this.nodes.length);
+    for (let i = 0; i < this.nodes.length; i++) {
+      this.xMeters[i] = this.nodes[i].point.longitude * kMetersPerDegreeLng;
+      this.yMeters[i] = this.nodes[i].point.latitude * kMetersPerDegreeLat;
     }
 
     this.buildKdTree();
@@ -201,63 +228,77 @@ class RoadGraph {
 
 class MinPriorityQueue {
   constructor() {
-    this.heap = [];
+    this.scores = new Float64Array(8192);
+    this.items = new Int32Array(8192);
+    this.size = 0;
+  }
+  clear() {
+    this.size = 0;
   }
   push(score, item) {
-    this.heap.push({ score, item });
-    this._up(this.heap.length - 1);
-  }
-  pop() {
-    if (this.heap.length === 0) return null;
-    const top = this.heap[0];
-    const bottom = this.heap.pop();
-    if (this.heap.length > 0) {
-      this.heap[0] = bottom;
-      this._down(0);
-    }
-    return top;
-  }
-  isEmpty() {
-    return this.heap.length === 0;
-  }
-  _up(i) {
+    let i = this.size++;
+    const scores = this.scores;
+    const items = this.items;
+    scores[i] = score;
+    items[i] = item;
     while (i > 0) {
       const p = (i - 1) >> 1;
-      if (this.heap[i].score < this.heap[p].score) {
-        [this.heap[i], this.heap[p]] = [this.heap[p], this.heap[i]];
+      if (scores[i] < scores[p]) {
+        const tmpS = scores[i];
+        scores[i] = scores[p];
+        scores[p] = tmpS;
+        const tmpI = items[i];
+        items[i] = items[p];
+        items[p] = tmpI;
         i = p;
       } else break;
     }
   }
-  _down(i) {
-    const len = this.heap.length;
-    while ((i << 1) + 1 < len) {
-      let left = (i << 1) + 1;
-      let right = left + 1;
-      let smallest = left;
-      if (right < len && this.heap[right].score < this.heap[left].score) {
-        smallest = right;
+  popItem() {
+    const items = this.items;
+    const scores = this.scores;
+    const topItem = items[0];
+    const last = --this.size;
+    if (last > 0) {
+      scores[0] = scores[last];
+      items[0] = items[last];
+      let i = 0;
+      while ((i << 1) + 1 < last) {
+        let left = (i << 1) + 1;
+        let right = left + 1;
+        let smallest = left;
+        if (right < last && scores[right] < scores[left]) {
+          smallest = right;
+        }
+        if (scores[smallest] < scores[i]) {
+          const tmpS = scores[i];
+          scores[i] = scores[smallest];
+          scores[smallest] = tmpS;
+          const tmpI = items[i];
+          items[i] = items[smallest];
+          items[smallest] = tmpI;
+          i = smallest;
+        } else break;
       }
-      if (this.heap[smallest].score < this.heap[i].score) {
-        [this.heap[i], this.heap[smallest]] = [this.heap[smallest], this.heap[i]];
-        i = smallest;
-      } else break;
     }
+    return topItem;
   }
 }
 
 class Router {
   constructor(graph) {
     this.graph = graph;
+    this.frontier = new MinPriorityQueue();
   }
 
   heuristic(from, to, objective) {
-    const meters = haversineMeters(this.graph.nodes[from].point, this.graph.nodes[to].point);
-    return objective === 'shortest' ? meters : meters / kMaxSupportedSpeedMps;
+    const dx = this.graph.xMeters[from] - this.graph.xMeters[to];
+    const dy = this.graph.yMeters[from] - this.graph.yMeters[to];
+    const meters = Math.sqrt(dx * dx + dy * dy);
+    return objective === 'shortest' ? meters : meters / kHeuristicFastestSpeedMps;
   }
 
   findRoute(origin, destination, objective = 'fastest', algorithm = 'astar') {
-    const startTime = performance.now();
     const startSnap = this.graph.nearestNode(origin);
     const goalSnap = this.graph.nearestNode(destination);
 
@@ -272,20 +313,24 @@ class Router {
     const start = startSnap.nearest;
     const goal = goalSnap.nearest;
     const nodeCount = this.graph.nodes.length;
-    const bestCost = new Array(nodeCount).fill(Infinity);
-    const parent = new Array(nodeCount).fill(-1);
-    const seenVisited = new Array(nodeCount).fill(false);
+    const bestCost = new Float64Array(nodeCount);
+    bestCost.fill(Infinity);
+    const parent = new Int32Array(nodeCount);
+    parent.fill(-1);
+    const seenVisited = new Uint8Array(nodeCount);
     const visitedNodeIds = [];
 
     let visitedNodes = 0;
     bestCost[start] = 0.0;
+
+    const startTime = performance.now();
 
     if (algorithm === 'dfs') {
       const stack = [start];
       while (stack.length > 0) {
         const current = stack.pop();
         if (seenVisited[current]) continue;
-        seenVisited[current] = true;
+        seenVisited[current] = 1;
         visitedNodes++;
         visitedNodeIds.push(current);
         if (current === goal) break;
@@ -293,20 +338,19 @@ class Router {
         const edges = this.graph.adjacency[current] || [];
         for (const edge of edges) {
           if (!seenVisited[edge.to]) {
-            const weight = objective === 'shortest' ? edge.meters : edge.seconds;
+            const dist = haversineMeters(this.graph.nodes[current].point, this.graph.nodes[edge.to].point);
             parent[edge.to] = current;
-            bestCost[edge.to] = bestCost[current] + weight;
+            bestCost[edge.to] = bestCost[current] + dist;
             stack.push(edge.to);
           }
         }
       }
     } else if (algorithm === 'bfs') {
-      const queue = [start];
-      let head = 0;
-      seenVisited[start] = true;
+      const fifo = [start];
+      seenVisited[start] = 1;
 
-      while (head < queue.length) {
-        const current = queue[head++];
+      while (fifo.length > 0) {
+        const current = fifo.shift();
         visitedNodes++;
         visitedNodeIds.push(current);
         if (current === goal) break;
@@ -314,49 +358,85 @@ class Router {
         const edges = this.graph.adjacency[current] || [];
         for (const edge of edges) {
           if (!seenVisited[edge.to]) {
-            seenVisited[edge.to] = true;
-            const weight = objective === 'shortest' ? edge.meters : edge.seconds;
-            bestCost[edge.to] = bestCost[current] + weight;
+            seenVisited[edge.to] = 1;
+            const dist = haversineMeters(this.graph.nodes[current].point, this.graph.nodes[edge.to].point);
+            bestCost[edge.to] = bestCost[current] + dist;
             parent[edge.to] = current;
-            queue.push(edge.to);
+            fifo.push(edge.to);
+          }
+        }
+      }
+    } else if (algorithm === 'astar') {
+      const frontier = this.frontier;
+      frontier.clear();
+      const shortest = objective === 'shortest';
+      const xMeters = this.graph.xMeters;
+      const yMeters = this.graph.yMeters;
+      const goalX = xMeters[goal];
+      const goalY = yMeters[goal];
+      const scale = shortest ? 1.0 : 1.0 / kHeuristicFastestSpeedMps;
+
+      const startDx = xMeters[start] - goalX;
+      const startDy = yMeters[start] - goalY;
+      frontier.push(Math.sqrt(startDx * startDx + startDy * startDy) * scale, start);
+
+      while (frontier.size > 0) {
+        const current = frontier.popItem();
+        if (seenVisited[current]) continue;
+        seenVisited[current] = 1;
+        visitedNodes++;
+        visitedNodeIds.push(current);
+        if (current === goal) break;
+
+        const currCost = bestCost[current];
+        const edges = this.graph.adjacency[current];
+        for (let i = 0; i < edges.length; i++) {
+          const edge = edges[i];
+          const to = edge.to;
+          if (seenVisited[to]) continue;
+          const weight = shortest ? edge.meters : edge.seconds;
+          const tentativeCost = currCost + weight;
+          if (tentativeCost + 1e-6 < bestCost[to]) {
+            bestCost[to] = tentativeCost;
+            parent[to] = current;
+            const dx = xMeters[to] - goalX;
+            const dy = yMeters[to] - goalY;
+            frontier.push(tentativeCost + Math.sqrt(dx * dx + dy * dy) * scale, to);
           }
         }
       }
     } else {
-      const frontier = new MinPriorityQueue();
-      const scoreFor = (node) => {
-        return bestCost[node] + (algorithm === 'astar' ? this.heuristic(node, goal, objective) : 0.0);
-      };
+      const frontier = this.frontier;
+      frontier.clear();
+      const shortest = objective === 'shortest';
+      frontier.push(0.0, start);
 
-      frontier.push(scoreFor(start), start);
-
-      while (!frontier.isEmpty()) {
-        const top = frontier.pop();
-        const current = top.item;
-        const score = top.score;
-
-        const expectedScore = scoreFor(current);
-        if (score > expectedScore + 1e-6) continue;
-
+      while (frontier.size > 0) {
+        const current = frontier.popItem();
+        if (seenVisited[current]) continue;
+        seenVisited[current] = 1;
         visitedNodes++;
-        if (!seenVisited[current]) {
-          seenVisited[current] = true;
-          visitedNodeIds.push(current);
-        }
+        visitedNodeIds.push(current);
         if (current === goal) break;
 
-        const edges = this.graph.adjacency[current] || [];
-        for (const edge of edges) {
-          const weight = objective === 'shortest' ? edge.meters : edge.seconds;
-          const tentativeCost = bestCost[current] + weight;
-          if (tentativeCost + 1e-6 < bestCost[edge.to]) {
-            bestCost[edge.to] = tentativeCost;
-            parent[edge.to] = current;
-            frontier.push(scoreFor(edge.to), edge.to);
+        const currCost = bestCost[current];
+        const edges = this.graph.adjacency[current];
+        for (let i = 0; i < edges.length; i++) {
+          const edge = edges[i];
+          const to = edge.to;
+          if (seenVisited[to]) continue;
+          const weight = shortest ? edge.meters : edge.seconds;
+          const tentativeCost = currCost + weight;
+          if (tentativeCost + 1e-6 < bestCost[to]) {
+            bestCost[to] = tentativeCost;
+            parent[to] = current;
+            frontier.push(tentativeCost, to);
           }
         }
       }
     }
+
+    const executionMicros = (performance.now() - startTime) * 1000.0;
 
     if (!isFinite(bestCost[goal])) {
       return { found: false, error: 'No legal road route connects these points' };
@@ -380,7 +460,6 @@ class Router {
     }
 
     const maneuvers = this.makeManeuvers(nodePath, objective);
-    const executionMicros = (performance.now() - startTime) * 1000.0;
 
     return {
       found: true,
@@ -418,11 +497,10 @@ class Router {
     for (let i = 1; i + 1 < path.length; i++) {
       const prevEdge = this.graph.edgeBetween(path[i - 1], path[i], objective);
       const nextEdge = this.graph.edgeBetween(path[i], path[i + 1], objective);
-      const prevBearing = bearingDegrees(this.graph.nodes[path[i - 1]].point, this.graph.nodes[path[i]].point);
-      const nextBearing = bearingDegrees(this.graph.nodes[path[i]].point, this.graph.nodes[path[i + 1]].point);
 
-      if (prevEdge.road_name !== nextEdge.road_name ||
-          Math.abs(angleDifferenceDegrees(prevBearing, nextBearing)) > 65.0) {
+      if (prevEdge.road_name !== nextEdge.road_name) {
+        const prevBearing = bearingDegrees(this.graph.nodes[path[i - 1]].point, this.graph.nodes[path[i]].point);
+        const nextBearing = bearingDegrees(this.graph.nodes[path[i]].point, this.graph.nodes[path[i + 1]].point);
         maneuvers.push({
           instruction: `${turnDescription(prevBearing, nextBearing)} onto ${nextEdge.road_name}`,
           coordinate: [this.graph.nodes[path[i]].point.longitude, this.graph.nodes[path[i]].point.latitude],
@@ -441,6 +519,52 @@ class Router {
     });
 
     return maneuvers;
+  }
+
+  compareRoutes(origin, destination, objective = 'fastest') {
+    const runBenchmark = (algo) => {
+      let result = null;
+      for (let w = 0; w < 2; w++) {
+        result = this.findRoute(origin, destination, objective, algo);
+        if (!result.found) return result;
+      }
+      const samples = [];
+      for (let run = 0; run < 7; run++) {
+        const sample = this.findRoute(origin, destination, objective, algo);
+        samples.push(sample.executionMicros);
+      }
+      samples.sort((a, b) => a - b);
+      result.executionMicros = samples[1];
+      return result;
+    };
+
+    const dijkstraRoute = runBenchmark('dijkstra');
+    if (!dijkstraRoute.found) {
+      return { found: false, error: dijkstraRoute.error };
+    }
+    const astarRoute = runBenchmark('astar');
+    const bfsRoute = runBenchmark('bfs');
+    const dfsRoute = runBenchmark('dfs');
+
+    const optimalCost = objective === 'shortest' ? dijkstraRoute.meters : dijkstraRoute.seconds;
+    const tolerance = Math.max(1.0, optimalCost * 0.005);
+
+    const comparisons = [astarRoute, dijkstraRoute, bfsRoute, dfsRoute].map((r) => {
+      const cost = objective === 'shortest' ? r.meters : r.seconds;
+      const optimal = Boolean(r.found && Math.abs(cost - optimalCost) <= tolerance);
+      return {
+        algorithmId: r.algorithm,
+        algorithm: ALGORITHM_NAMES[r.algorithm] || 'A*',
+        distanceMeters: Math.round(r.meters * 10) / 10,
+        durationSeconds: Math.round(r.seconds * 10) / 10,
+        visitedNodes: r.visitedNodes,
+        pathNodes: r.nodePath.length,
+        executionMicros: Math.round(r.executionMicros * 10) / 10,
+        optimal,
+      };
+    });
+
+    return { found: true, comparisons };
   }
 }
 
@@ -465,20 +589,13 @@ graph.loadCsv(graphPath);
 console.log(`[Router API] Graph loaded: ${graph.nodes.length} nodes, ${graph.edgeCount} directed edges.`);
 
 const router = new Router(graph);
-
-const ALGORITHM_NAMES = {
-  astar: 'A*',
-  dijkstra: 'Dijkstra',
-  bfs: 'BFS',
-  dfs: 'DFS',
-};
-
-function parseAlgorithm(raw) {
-  const val = (raw || '').toLowerCase();
-  if (val === 'dijkstra') return 'dijkstra';
-  if (val === 'bfs') return 'bfs';
-  if (val === 'dfs') return 'dfs';
-  return 'astar';
+if (graph.nodes.length >= 2) {
+  const p0 = { latitude: 28.6429, longitude: 77.2191 };
+  const p1 = { latitude: 28.5494, longitude: 77.2519 };
+  for (let i = 0; i < 6; i++) {
+    router.compareRoutes(p0, p1, 'fastest');
+    router.compareRoutes(p0, p1, 'shortest');
+  }
 }
 
 const server = http.createServer((req, res) => {
@@ -596,34 +713,12 @@ const server = http.createServer((req, res) => {
     const destination = { latitude: toLat, longitude: toLng };
 
     if (pathname === '/api/compare') {
-      const dijkstraRoute = router.findRoute(origin, destination, objective, 'dijkstra');
-      if (!dijkstraRoute.found) {
-        sendJson(400, { error: dijkstraRoute.error });
+      const cmp = router.compareRoutes(origin, destination, objective);
+      if (!cmp.found) {
+        sendJson(400, { error: cmp.error });
         return;
       }
-      const astarRoute = router.findRoute(origin, destination, objective, 'astar');
-      const bfsRoute = router.findRoute(origin, destination, objective, 'bfs');
-      const dfsRoute = router.findRoute(origin, destination, objective, 'dfs');
-
-      const optimalCost = objective === 'shortest' ? dijkstraRoute.meters : dijkstraRoute.seconds;
-      const tolerance = Math.max(1.0, optimalCost * 0.005);
-
-      const comparisons = [astarRoute, dijkstraRoute, bfsRoute, dfsRoute].map((r) => {
-        const cost = objective === 'shortest' ? r.meters : r.seconds;
-        const optimal = Boolean(r.found && Math.abs(cost - optimalCost) <= tolerance);
-        return {
-          algorithmId: r.algorithm,
-          algorithm: ALGORITHM_NAMES[r.algorithm] || 'A*',
-          distanceMeters: Math.round(r.meters * 10) / 10,
-          durationSeconds: Math.round(r.seconds * 10) / 10,
-          visitedNodes: r.visitedNodes,
-          pathNodes: r.nodePath.length,
-          executionMicros: Math.round(r.executionMicros * 10) / 10,
-          optimal,
-        };
-      });
-
-      sendJson(200, { comparisons });
+      sendJson(200, { comparisons: cmp.comparisons });
       return;
     }
 

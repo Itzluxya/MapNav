@@ -188,13 +188,28 @@ std::string route_json(const Route& route, const RoadGraph& graph, Objective obj
 
 std::string compare_json(const Router& router, const Coordinate& origin, const Coordinate& destination,
                          Objective objective) {
-  const Route dijkstra_route = router.find_route(origin, destination, objective, Algorithm::Dijkstra);
+  const auto benchmark = [&](Algorithm algorithm) {
+    // Warm-up pass
+    Route result = router.find_route(origin, destination, objective, algorithm);
+    if (!result.found) return result;
+    std::vector<double> samples;
+    samples.reserve(7);
+    for (int run = 0; run < 7; ++run) {
+      Route sample = router.find_route(origin, destination, objective, algorithm);
+      samples.push_back(sample.execution_micros);
+    }
+    std::sort(samples.begin(), samples.end());
+    result.execution_micros = samples[1];
+    return result;
+  };
+
+  const Route dijkstra_route = benchmark(Algorithm::Dijkstra);
   if (!dijkstra_route.found) {
     return "{\"error\":\"" + json_escape(dijkstra_route.error) + "\"}";
   }
-  const Route astar_route = router.find_route(origin, destination, objective, Algorithm::AStar);
-  const Route bfs_route = router.find_route(origin, destination, objective, Algorithm::BFS);
-  const Route dfs_route = router.find_route(origin, destination, objective, Algorithm::DFS);
+  const Route astar_route = benchmark(Algorithm::AStar);
+  const Route bfs_route = benchmark(Algorithm::BFS);
+  const Route dfs_route = benchmark(Algorithm::DFS);
 
   const double optimal_cost = objective == Objective::Shortest ? dijkstra_route.meters : dijkstra_route.seconds;
   const double tolerance = std::max(1.0, optimal_cost * 0.005);

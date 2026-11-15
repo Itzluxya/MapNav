@@ -22,6 +22,8 @@ struct Node {
   Coordinate point;
   std::string name;
   bool is_landmark{true};
+  double x_meters{};
+  double y_meters{};
 };
 
 enum class Objective { Fastest, Shortest };

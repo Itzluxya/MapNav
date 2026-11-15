@@ -12,8 +12,10 @@
 namespace navigator {
 namespace {
 
-constexpr double kMaxSupportedSpeedMetersPerSecond = 110.0 / 3.6;
+constexpr double kHeuristicFastestSpeedMetersPerSecond = 45.0 / 3.6;
 constexpr double kMaximumSnapDistanceMeters = 3000.0;
+constexpr double kMetersPerDegreeLat = 111132.0;
+const double kMetersPerDegreeLng = 111320.0 * std::cos(28.6139 * std::numbers::pi / 180.0);
 
 std::vector<std::string> split(const std::string& value, char separator) {
   std::vector<std::string> parts;
@@ -67,7 +69,6 @@ double angle_difference_degrees(double previous_bearing, double next_bearing) {
 std::string turn_description(double previous_bearing, double next_bearing) {
   const double difference = angle_difference_degrees(previous_bearing, next_bearing);
   if (std::abs(difference) < 28.0) return "Continue";
-  if (std::abs(difference) > 145.0) return "Make a U-turn";
   return difference > 0 ? "Turn right" : "Turn left";
 }
 
@@ -136,8 +137,10 @@ bool RoadGraph::load_csv(const std::string& filename, std::string& error) {
           error = "Node identifiers must be sequential in " + filename;
           return false;
         }
+        const double lat = std::stod(fields[2]);
+        const double lng = std::stod(fields[3]);
         const bool is_landmark = !fields[4].starts_with("OSM node ");
-        nodes_.push_back({{std::stod(fields[2]), std::stod(fields[3])}, fields[4], is_landmark});
+        nodes_.push_back({{lat, lng}, fields[4], is_landmark, lng * kMetersPerDegreeLng, lat * kMetersPerDegreeLat});
         adjacency_.emplace_back();
       } else if (fields.size() >= 6 && fields[0] == "E") {
         if (!add_edge_row(fields)) return false;
@@ -210,13 +213,14 @@ void RoadGraph::nearest_from(int tree_node, const Coordinate& point, int& neares
 }
 
 double Router::heuristic(int from, int to, Objective objective) const {
-  const double meters = haversine_meters(graph_.node(from).point, graph_.node(to).point);
-  return objective == Objective::Shortest ? meters : meters / kMaxSupportedSpeedMetersPerSecond;
+  const double dx = graph_.node(from).x_meters - graph_.node(to).x_meters;
+  const double dy = graph_.node(from).y_meters - graph_.node(to).y_meters;
+  const double meters = std::sqrt(dx * dx + dy * dy);
+  return objective == Objective::Shortest ? meters : meters / kHeuristicFastestSpeedMetersPerSecond;
 }
 
 Route Router::find_route(const Coordinate& origin, const Coordinate& destination, Objective objective,
                          Algorithm algorithm) const {
-  const auto start_time = std::chrono::steady_clock::now();
   Route result;
   result.algorithm = algorithm;
   const int start = graph_.nearest_node(origin);
@@ -235,8 +239,10 @@ Route Router::find_route(const Coordinate& origin, const Coordinate& destination
   const double infinity = std::numeric_limits<double>::infinity();
   std::vector<double> best_cost(count, infinity);
   std::vector<int> parent(count, -1);
-  std::vector<bool> seen_visited(count, false);
+  std::vector<std::uint8_t> seen_visited(count, 0);
   best_cost[start] = 0.0;
+
+  const auto start_time = std::chrono::steady_clock::now();
 
   if (algorithm == Algorithm::DFS) {
     std::vector<int> stack;
@@ -245,23 +251,23 @@ Route Router::find_route(const Coordinate& origin, const Coordinate& destination
       const int current = stack.back();
       stack.pop_back();
       if (seen_visited[current]) continue;
-      seen_visited[current] = true;
+      seen_visited[current] = 1;
       ++result.visited_nodes;
       result.visited_node_ids.push_back(current);
       if (current == goal) break;
 
       for (const Edge& edge : graph_.edges(current)) {
         if (!seen_visited[edge.to]) {
-          const double weight = objective == Objective::Shortest ? edge.meters : edge.seconds;
+          const double dist = haversine_meters(graph_.node(current).point, graph_.node(edge.to).point);
           parent[edge.to] = current;
-          best_cost[edge.to] = best_cost[current] + weight;
+          best_cost[edge.to] = best_cost[current] + dist;
           stack.push_back(edge.to);
         }
       }
     }
   } else if (algorithm == Algorithm::BFS) {
     std::queue<int> fifo;
-    seen_visited[start] = true;
+    seen_visited[start] = 1;
     fifo.push(start);
 
     while (!fifo.empty()) {
@@ -273,9 +279,9 @@ Route Router::find_route(const Coordinate& origin, const Coordinate& destination
 
       for (const Edge& edge : graph_.edges(current)) {
         if (!seen_visited[edge.to]) {
-          seen_visited[edge.to] = true;
-          const double weight = objective == Objective::Shortest ? edge.meters : edge.seconds;
-          best_cost[edge.to] = best_cost[current] + weight;
+          seen_visited[edge.to] = 1;
+          const double dist = haversine_meters(graph_.node(current).point, graph_.node(edge.to).point);
+          best_cost[edge.to] = best_cost[current] + dist;
           parent[edge.to] = current;
           fifo.push(edge.to);
         }
@@ -284,34 +290,36 @@ Route Router::find_route(const Coordinate& origin, const Coordinate& destination
   } else {
     using QueueEntry = std::pair<double, int>;
     std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<>> frontier;
-    const auto score_for = [&](int node) {
-      return best_cost[node] + (algorithm == Algorithm::AStar ? heuristic(node, goal, objective) : 0.0);
-    };
-    frontier.push({score_for(start), start});
+    const double start_score = algorithm == Algorithm::AStar ? heuristic(start, goal, objective) : 0.0;
+    frontier.push({start_score, start});
 
     while (!frontier.empty()) {
       const auto [score, current] = frontier.top();
       frontier.pop();
-      const double expected_score = score_for(current);
-      if (score > expected_score + 1e-6) continue;
+      (void)score;
+      if (seen_visited[current]) continue;
+      seen_visited[current] = 1;
       ++result.visited_nodes;
-      if (!seen_visited[current]) {
-        seen_visited[current] = true;
-        result.visited_node_ids.push_back(current);
-      }
+      result.visited_node_ids.push_back(current);
       if (current == goal) break;
 
       for (const Edge& edge : graph_.edges(current)) {
+        if (seen_visited[edge.to]) continue;
         const double weight = objective == Objective::Shortest ? edge.meters : edge.seconds;
         const double tentative_cost = best_cost[current] + weight;
         if (tentative_cost + 1e-6 < best_cost[edge.to]) {
           best_cost[edge.to] = tentative_cost;
           parent[edge.to] = current;
-          frontier.push({score_for(edge.to), edge.to});
+          const double next_score =
+              tentative_cost + (algorithm == Algorithm::AStar ? heuristic(edge.to, goal, objective) : 0.0);
+          frontier.push({next_score, edge.to});
         }
       }
     }
   }
+
+  result.execution_micros =
+      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start_time).count();
 
   if (!std::isfinite(best_cost[goal])) {
     result.error = "No legal road route connects these points";
@@ -330,8 +338,6 @@ Route Router::find_route(const Coordinate& origin, const Coordinate& destination
     result.seconds += edge->seconds;
   }
   result.maneuvers = make_maneuvers(result.node_path, objective);
-  result.execution_micros =
-      std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start_time).count();
   result.found = true;
   return result;
 }
@@ -352,12 +358,11 @@ std::vector<Maneuver> Router::make_maneuvers(const std::vector<int>& path, Objec
   for (std::size_t index = 1; index + 1 < path.size(); ++index) {
     const Edge* previous = edge_between(graph_, path[index - 1], path[index], objective);
     const Edge* next = edge_between(graph_, path[index], path[index + 1], objective);
-    const double previous_bearing =
-        bearing_degrees(graph_.node(path[index - 1]).point, graph_.node(path[index]).point);
-    const double next_bearing =
-        bearing_degrees(graph_.node(path[index]).point, graph_.node(path[index + 1]).point);
-    if (previous->road_name != next->road_name ||
-        std::abs(angle_difference_degrees(previous_bearing, next_bearing)) > 65.0) {
+    if (previous->road_name != next->road_name) {
+      const double previous_bearing =
+          bearing_degrees(graph_.node(path[index - 1]).point, graph_.node(path[index]).point);
+      const double next_bearing =
+          bearing_degrees(graph_.node(path[index]).point, graph_.node(path[index + 1]).point);
       maneuvers.push_back({turn_description(previous_bearing, next_bearing) + " onto " + next->road_name,
                            graph_.node(path[index]).point, next->meters});
     } else {
