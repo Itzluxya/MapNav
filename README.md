@@ -81,10 +81,12 @@ MapLibre renders the map; it is not the routing provider. The bundled demo uses 
 
 ```text
 src/                    React + TypeScript + MapLibre navigation UI
+api/[...slug].js        Vercel Serverless Function entrypoint for /api/*
+backend/app.js          Shared Node.js road-graph routing engine & HTTP handler
+backend/server.js       Local Node.js HTTP server wrapper
 backend/src/            C++20 graph, routing algorithms (A* / Dijkstra), and HTTP API
-backend/server.js       Node.js HTTP API mirror of the routing engine
 backend/data/           Runnable Delhi NCR starter graph
 backend/tools/          OSM XML to graph converter scripts
 scripts/dev-full.mjs    Combined backend + Vite dev launcher
-vercel.json             Vercel deployment API rewrite config
+vercel.json             Vercel serverless function bundling config
 ```
