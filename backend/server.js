@@ -300,26 +300,25 @@ class Router {
           }
         }
       }
-    } else if (algorithm === 'greedy') {
-      const frontier = new MinPriorityQueue();
-      frontier.push(this.heuristic(start, goal, objective), start);
+    } else if (algorithm === 'bfs') {
+      const queue = [start];
+      let head = 0;
+      seenVisited[start] = true;
 
-      while (!frontier.isEmpty()) {
-        const top = frontier.pop();
-        const current = top.item;
-        if (seenVisited[current]) continue;
-        seenVisited[current] = true;
+      while (head < queue.length) {
+        const current = queue[head++];
         visitedNodes++;
         visitedNodeIds.push(current);
         if (current === goal) break;
 
         const edges = this.graph.adjacency[current] || [];
         for (const edge of edges) {
-          const weight = objective === 'shortest' ? edge.meters : edge.seconds;
-          if (!isFinite(bestCost[edge.to])) {
+          if (!seenVisited[edge.to]) {
+            seenVisited[edge.to] = true;
+            const weight = objective === 'shortest' ? edge.meters : edge.seconds;
             bestCost[edge.to] = bestCost[current] + weight;
             parent[edge.to] = current;
-            frontier.push(this.heuristic(edge.to, goal, objective), edge.to);
+            queue.push(edge.to);
           }
         }
       }
@@ -470,14 +469,14 @@ const router = new Router(graph);
 const ALGORITHM_NAMES = {
   astar: 'A*',
   dijkstra: 'Dijkstra',
-  greedy: 'Greedy BFS',
+  bfs: 'BFS',
   dfs: 'DFS',
 };
 
 function parseAlgorithm(raw) {
   const val = (raw || '').toLowerCase();
   if (val === 'dijkstra') return 'dijkstra';
-  if (val === 'greedy') return 'greedy';
+  if (val === 'bfs') return 'bfs';
   if (val === 'dfs') return 'dfs';
   return 'astar';
 }
@@ -603,13 +602,13 @@ const server = http.createServer((req, res) => {
         return;
       }
       const astarRoute = router.findRoute(origin, destination, objective, 'astar');
-      const greedyRoute = router.findRoute(origin, destination, objective, 'greedy');
+      const bfsRoute = router.findRoute(origin, destination, objective, 'bfs');
       const dfsRoute = router.findRoute(origin, destination, objective, 'dfs');
 
       const optimalCost = objective === 'shortest' ? dijkstraRoute.meters : dijkstraRoute.seconds;
       const tolerance = Math.max(1.0, optimalCost * 0.005);
 
-      const comparisons = [astarRoute, dijkstraRoute, greedyRoute, dfsRoute].map((r) => {
+      const comparisons = [astarRoute, dijkstraRoute, bfsRoute, dfsRoute].map((r) => {
         const cost = objective === 'shortest' ? r.meters : r.seconds;
         const optimal = Boolean(r.found && Math.abs(cost - optimalCost) <= tolerance);
         return {

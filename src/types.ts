@@ -6,7 +6,7 @@ export type Coordinate = {
 
 export type Objective = 'fastest' | 'shortest';
 
-export type AlgorithmId = 'astar' | 'dijkstra' | 'greedy' | 'dfs';
+export type AlgorithmId = 'astar' | 'dijkstra' | 'bfs' | 'dfs';
 
 export type Place = Coordinate & { id: number };
 

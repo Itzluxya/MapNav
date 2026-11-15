@@ -259,26 +259,25 @@ Route Router::find_route(const Coordinate& origin, const Coordinate& destination
         }
       }
     }
-  } else if (algorithm == Algorithm::Greedy) {
-    using QueueEntry = std::pair<double, int>;
-    std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<>> frontier;
-    frontier.push({heuristic(start, goal, objective), start});
+  } else if (algorithm == Algorithm::BFS) {
+    std::queue<int> fifo;
+    seen_visited[start] = true;
+    fifo.push(start);
 
-    while (!frontier.empty()) {
-      const auto [score, current] = frontier.top();
-      frontier.pop();
-      if (seen_visited[current]) continue;
-      seen_visited[current] = true;
+    while (!fifo.empty()) {
+      const int current = fifo.front();
+      fifo.pop();
       ++result.visited_nodes;
       result.visited_node_ids.push_back(current);
       if (current == goal) break;
 
       for (const Edge& edge : graph_.edges(current)) {
-        const double weight = objective == Objective::Shortest ? edge.meters : edge.seconds;
-        if (!std::isfinite(best_cost[edge.to])) {
+        if (!seen_visited[edge.to]) {
+          seen_visited[edge.to] = true;
+          const double weight = objective == Objective::Shortest ? edge.meters : edge.seconds;
           best_cost[edge.to] = best_cost[current] + weight;
           parent[edge.to] = current;
-          frontier.push({heuristic(edge.to, goal, objective), edge.to});
+          fifo.push(edge.to);
         }
       }
     }

@@ -25,7 +25,7 @@ struct Node {
 };
 
 enum class Objective { Fastest, Shortest };
-enum class Algorithm { AStar, Dijkstra, Greedy, DFS };
+enum class Algorithm { AStar, Dijkstra, BFS, DFS };
 
 struct Maneuver {
   std::string instruction;

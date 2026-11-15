@@ -29,7 +29,7 @@ const CONNAUGHT_PLACE: Coordinate = { latitude: 28.6315, longitude: 77.2167, lab
 const ALGORITHM_OPTIONS: Array<{ id: AlgorithmId; label: string }> = [
   { id: 'astar', label: 'A*' },
   { id: 'dijkstra', label: 'Dijkstra' },
-  { id: 'greedy', label: 'Greedy BFS' },
+  { id: 'bfs', label: 'BFS' },
   { id: 'dfs', label: 'DFS' },
 ];
 

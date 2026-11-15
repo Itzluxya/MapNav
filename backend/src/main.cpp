@@ -126,7 +126,7 @@ std::string coordinate_json(const Coordinate& coordinate) {
 const char* algorithm_name(Algorithm algorithm) {
   switch (algorithm) {
     case Algorithm::Dijkstra: return "Dijkstra";
-    case Algorithm::Greedy: return "Greedy BFS";
+    case Algorithm::BFS: return "BFS";
     case Algorithm::DFS: return "DFS";
     case Algorithm::AStar:
     default: return "A*";
@@ -136,7 +136,7 @@ const char* algorithm_name(Algorithm algorithm) {
 const char* algorithm_id(Algorithm algorithm) {
   switch (algorithm) {
     case Algorithm::Dijkstra: return "dijkstra";
-    case Algorithm::Greedy: return "greedy";
+    case Algorithm::BFS: return "bfs";
     case Algorithm::DFS: return "dfs";
     case Algorithm::AStar:
     default: return "astar";
@@ -148,7 +148,7 @@ Algorithm parse_algorithm(const std::map<std::string, std::string>& parameters) 
   if (found == parameters.end()) return Algorithm::AStar;
   const std::string value = lowercase(found->second);
   if (value == "dijkstra") return Algorithm::Dijkstra;
-  if (value == "greedy") return Algorithm::Greedy;
+  if (value == "bfs") return Algorithm::BFS;
   if (value == "dfs") return Algorithm::DFS;
   return Algorithm::AStar;
 }
@@ -193,13 +193,13 @@ std::string compare_json(const Router& router, const Coordinate& origin, const C
     return "{\"error\":\"" + json_escape(dijkstra_route.error) + "\"}";
   }
   const Route astar_route = router.find_route(origin, destination, objective, Algorithm::AStar);
-  const Route greedy_route = router.find_route(origin, destination, objective, Algorithm::Greedy);
+  const Route bfs_route = router.find_route(origin, destination, objective, Algorithm::BFS);
   const Route dfs_route = router.find_route(origin, destination, objective, Algorithm::DFS);
 
   const double optimal_cost = objective == Objective::Shortest ? dijkstra_route.meters : dijkstra_route.seconds;
   const double tolerance = std::max(1.0, optimal_cost * 0.005);
 
-  const std::vector<Route> routes = {astar_route, dijkstra_route, greedy_route, dfs_route};
+  const std::vector<Route> routes = {astar_route, dijkstra_route, bfs_route, dfs_route};
   std::ostringstream output;
   output << std::fixed << std::setprecision(1);
   output << "{\"comparisons\":[";
