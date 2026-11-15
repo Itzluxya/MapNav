@@ -1,0 +1,11 @@
+node_modules/
+dist/
+backend/bin/
+backend/data/delhi_ncr.osm
+backend/data/delhi_ncr_graph.csv
+.env
+.env.*
+.DS_Store
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
